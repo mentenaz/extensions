@@ -5,13 +5,23 @@
 # for the API this posts to).
 #
 # Two jobs:
-#   sync-fork         merges upstream/main in; a plain merge keeps
+#   sync-fork         merges upstream/main in (a plain merge keeps
 #                     extensions.toml and its submodule pins in lockstep,
-#                     since upstream commits them together.
-#   build-and-publish only runs if that merge actually brought in commits.
-#                     Diffs extensions.toml against the live registry,
-#                     builds only what changed with extension_cli, uploads
-#                     the packaged archives to one GitHub Release for this
+#                     since upstream commits them together), then diffs
+#                     the (possibly just-merged) extensions.toml against
+#                     the live registry. This diff — not "did the merge
+#                     produce new commits" — is what decides whether
+#                     build-and-publish runs: a commit pushed directly to
+#                     this fork (e.g. adding your own extension) changes
+#                     nothing about the upstream merge, but still needs a
+#                     build. Needs only Python + curl, not Rust, so this
+#                     stays cheap even when nothing changed.
+#   build-and-publish only runs when that diff found something. Fetches
+#                     only the submodules for the extensions that actually
+#                     changed (this repo has 1000+ submodules — checking
+#                     all of them out on every run would be needlessly
+#                     slow), builds each with extension_cli, uploads the
+#                     packaged archives to one GitHub Release for this
 #                     run, and POSTs the results to the sync relay route.
 #
 # Secrets to set on this fork (Settings -> Secrets and variables -> Actions):
@@ -47,7 +57,8 @@ jobs:
   sync-fork:
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.merge.outputs.changed }}
+      changed: ${{ steps.diff.outputs.changed }}
+      changed_json: ${{ steps.diff.outputs.changed_json }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,7 +72,6 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
 
       - name: Merge upstream/main
-        id: merge
         run: |
           git remote add upstream https://github.com/zed-industries/extensions.git
           git fetch upstream main
@@ -69,26 +79,83 @@ jobs:
           git merge upstream/main --no-edit
           after=$(git rev-parse HEAD)
           if [ "$before" != "$after" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+            git push origin HEAD:${{ github.ref_name }}
           fi
 
-      - name: Push merge
-        if: steps.merge.outputs.changed == 'true'
-        run: git push origin HEAD:${{ github.ref_name }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Compares extensions.toml (post-merge) against the live registry's
+      # versions. Anything new, removed-then-readded, or version-bumped —
+      # whether that came from the upstream merge above or a direct commit
+      # to this fork — ends up in changed_json for build-and-publish to
+      # act on. No Rust needed here, so an empty diff stays fast.
+      - name: Diff extensions.toml against the live registry
+        id: diff
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import tomllib
+          import urllib.error
+          import urllib.request
+
+          with open("extensions.toml", "rb") as f:
+              toml_data = tomllib.load(f)
+
+          live = {}
+          try:
+              with urllib.request.urlopen(f"{os.environ['REGISTRY_API_URL']}/extensions") as resp:
+                  for row in json.load(resp)["data"]:
+                      live[row["id"]] = row["version"]
+          except urllib.error.URLError as e:
+              print(f"warning: could not fetch live registry, treating everything as new: {e}")
+
+          changed = [
+              {"id": ext_id, **entry}
+              for ext_id, entry in toml_data.items()
+              if live.get(ext_id) != entry.get("version")
+          ]
+          print(f"{len(changed)} of {len(toml_data)} extensions changed")
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a") as f:
+              f.write(f"changed={'true' if changed else 'false'}\n")
+              f.write("changed_json<<EOF\n")
+              f.write(json.dumps(changed))
+              f.write("\nEOF\n")
+          PY
 
   build-and-publish:
     needs: sync-fork
     if: needs.sync-fork.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout this fork (post-merge, with submodules)
+      - name: Checkout this fork (post-merge, submodules fetched below)
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
-          submodules: recursive
+          submodules: false
           fetch-depth: 1
+
+      - name: Write the changed-extensions list
+        env:
+          CHANGED_JSON: ${{ needs.sync-fork.outputs.changed_json }}
+        run: echo "$CHANGED_JSON" > /tmp/changed.json
+
+      # Only the submodules for extensions that actually changed — this
+      # repo has 1000+ submodules, so `submodules: recursive` on checkout
+      # would clone all of them every run.
+      - name: Fetch only the changed submodules
+        run: |
+          python3 -c "
+          import json
+          changed = json.load(open('/tmp/changed.json'))
+          print(' '.join(c['submodule'] for c in changed))
+          " > /tmp/submodule_paths.txt
+          xargs -a /tmp/submodule_paths.txt git submodule update --init --depth 1 --
 
       - name: Checkout Forge Super (for extension_cli)
         uses: actions/checkout@v4
@@ -109,46 +176,22 @@ jobs:
         working-directory: zed_Source
         run: cargo build --release -p extension_cli
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Diff extensions.toml against the live registry, build what changed
-        id: diff
+      - name: Build each changed extension
+        id: build
         run: |
           python3 - <<'PY'
           import json
-          import os
           import pathlib
           import subprocess
-          import tomllib
-          import urllib.error
-          import urllib.request
 
-          with open("extensions.toml", "rb") as f:
-              toml_data = tomllib.load(f)
-
-          live = {}
-          try:
-              with urllib.request.urlopen(f"{os.environ['REGISTRY_API_URL']}/extensions") as resp:
-                  for row in json.load(resp)["data"]:
-                      live[row["id"]] = row["version"]
-          except urllib.error.URLError as e:
-              print(f"warning: could not fetch live registry, treating everything as new: {e}")
-
-          changed = {
-              ext_id: entry
-              for ext_id, entry in toml_data.items()
-              if live.get(ext_id) != entry.get("version")
-          }
-          print(f"{len(changed)} of {len(toml_data)} extensions changed")
+          changed = json.load(open("/tmp/changed.json"))
 
           assets_dir = pathlib.Path("/tmp/release-assets")
           assets_dir.mkdir(parents=True, exist_ok=True)
           results = []
 
-          for ext_id, entry in changed.items():
+          for entry in changed:
+              ext_id = entry["id"]
               submodule = pathlib.Path(entry["submodule"])
               sub_path = entry.get("path")
               source_dir = submodule / sub_path if sub_path else submodule
