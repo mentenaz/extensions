@@ -49,6 +49,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 env:
   REGISTRY_API_URL: https://forge.mentenaz-server.com/api/registry
@@ -58,6 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
+      more_pending: ${{ steps.diff.outputs.more_pending }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -107,7 +109,7 @@ jobs:
           # extensions in one job — it just catches up over several runs
           # instead. Also keeps the list small enough to pass between jobs
           # as a file without hitting argument/env size limits.
-          MAX_PER_RUN = 5
+          MAX_PER_RUN = 20
 
           with open("extensions.toml", "rb") as f:
               toml_data = tomllib.load(f)
@@ -139,6 +141,7 @@ jobs:
           github_output = os.environ["GITHUB_OUTPUT"]
           with open(github_output, "a") as f:
               f.write(f"changed={'true' if changed else 'false'}\n")
+              f.write(f"more_pending={'true' if len(all_changed) > len(changed) else 'false'}\n")
           PY
 
       - name: Upload the changed-extensions list
@@ -317,3 +320,17 @@ jobs:
           with urllib.request.urlopen(req) as resp:
               print(resp.read().decode())
           PY
+
+      # Clears a backlog (e.g. the initial empty-registry backfill) over
+      # several back-to-back runs instead of waiting six hours between
+      # each MAX_PER_RUN-sized batch. Based on sync-fork's diff, not on
+      # whether this run's build/release actually succeeded, so the chain
+      # keeps going even if some extensions in this batch failed to build
+      # — the next run's diff decides what's still pending from scratch.
+      # Naturally stops once nothing's left; the schedule trigger then
+      # covers ongoing incremental syncs as usual.
+      - name: Trigger the next run if more of the backlog remains
+        if: needs.sync-fork.outputs.more_pending == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run registry-sync.yml --repo "${{ github.repository }}"
