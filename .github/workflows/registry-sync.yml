@@ -107,7 +107,7 @@ jobs:
           # extensions in one job — it just catches up over several runs
           # instead. Also keeps the list small enough to pass between jobs
           # as a file without hitting argument/env size limits.
-          MAX_PER_RUN = 25
+          MAX_PER_RUN = 5
 
           with open("extensions.toml", "rb") as f:
               toml_data = tomllib.load(f)
