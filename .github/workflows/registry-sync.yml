@@ -228,7 +228,7 @@ jobs:
               try:
                   subprocess.run(
                       [
-                          "zed_Source/target/release/extension_cli",
+                          "zed_Source/target/release/zed-extension",
                           "--source-dir", str(source_dir),
                           "--output-dir", str(out_dir),
                           "--scratch-dir", str(scratch_dir),
