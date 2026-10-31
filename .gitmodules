@@ -6321,3 +6321,6 @@
 [submodule "extensions/zwirn"]
 	path = extensions/zwirn
 	url = https://codeberg.org/polymorphicengine/zwirn-zed-extension.git
+[submodule "extensions/forge-registry-smoke-test"]
+	path = extensions/forge-registry-smoke-test
+	url = https://github.com/mentenaz/forge-registry-smoke-test.git
