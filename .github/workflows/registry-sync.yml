@@ -247,11 +247,19 @@ jobs:
 
           pathlib.Path("/tmp/results.json").write_text(json.dumps(results))
           print(f"{len(results)} extension(s) built successfully")
+
+          import os
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"built={'true' if results else 'false'}\n")
           PY
 
       - name: Create release with the built archives
         id: release
-        if: hashFiles('/tmp/release-assets/*') != ''
+        # hashFiles() only searches within $GITHUB_WORKSPACE, not arbitrary
+        # absolute paths like /tmp/release-assets — it would always report
+        # no match here regardless of what's actually in /tmp, so this
+        # gates on the previous step's own output instead.
+        if: steps.build.outputs.built == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
