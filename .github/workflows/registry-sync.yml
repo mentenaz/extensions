@@ -1,0 +1,246 @@
+# Keeps this fork in sync with zed-industries/extensions and republishes
+# whatever changed to Forge's own registry (see
+# E:\zed_Source\crates\extension_host for the client that reads it, and
+# H:\Persornal\Mentenaz_forge\@mentenaz\Forge_LandingPage\src\app\api\registry
+# for the API this posts to).
+#
+# Two jobs:
+#   sync-fork         merges upstream/main in; a plain merge keeps
+#                     extensions.toml and its submodule pins in lockstep,
+#                     since upstream commits them together.
+#   build-and-publish only runs if that merge actually brought in commits.
+#                     Diffs extensions.toml against the live registry,
+#                     builds only what changed with extension_cli, uploads
+#                     the packaged archives to one GitHub Release for this
+#                     run, and POSTs the results to the sync relay route.
+#
+# Secrets to set on this fork (Settings -> Secrets and variables -> Actions):
+#   FORGE_REGISTRY_SYNC_SECRET   shared secret; must match the same-named
+#                                 env var on the Forge_LandingPage Vercel
+#                                 project.
+#   ZED_SOURCE_TOKEN              only needed if mentenaz/zed_Source is
+#                                 private — a PAT with read access to it,
+#                                 used to check it out to build extension_cli.
+#                                 Omit if that repo is public; the checkout
+#                                 step below falls back to the default
+#                                 GITHUB_TOKEN, which can't read another
+#                                 private repo.
+#
+# Also requires: Settings -> Actions -> General -> Workflow permissions
+# set to "Read and write permissions", so sync-fork can push the merge and
+# build-and-publish can create a Release.
+
+name: registry-sync
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  REGISTRY_API_URL: https://forge.mentenaz-server.com/api/registry
+
+jobs:
+  sync-fork:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Configure git identity
+        run: |
+          git config user.name "forge-registry-sync[bot]"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Merge upstream/main
+        id: merge
+        run: |
+          git remote add upstream https://github.com/zed-industries/extensions.git
+          git fetch upstream main
+          before=$(git rev-parse HEAD)
+          git merge upstream/main --no-edit
+          after=$(git rev-parse HEAD)
+          if [ "$before" != "$after" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push merge
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:${{ github.ref_name }}
+
+  build-and-publish:
+    needs: sync-fork
+    if: needs.sync-fork.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this fork (post-merge, with submodules)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout Forge Super (for extension_cli)
+        uses: actions/checkout@v4
+        with:
+          repository: mentenaz/zed_Source
+          path: zed_Source
+          token: ${{ secrets.ZED_SOURCE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # extension_cli has its own rust-toolchain.toml in zed_Source; cargo
+      # picks that pinned version up automatically via rustup, no need to
+      # hardcode a version here.
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "zed_Source -> target"
+
+      - name: Build extension_cli
+        working-directory: zed_Source
+        run: cargo build --release -p extension_cli
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Diff extensions.toml against the live registry, build what changed
+        id: diff
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import tomllib
+          import urllib.error
+          import urllib.request
+
+          with open("extensions.toml", "rb") as f:
+              toml_data = tomllib.load(f)
+
+          live = {}
+          try:
+              with urllib.request.urlopen(f"{os.environ['REGISTRY_API_URL']}/extensions") as resp:
+                  for row in json.load(resp)["data"]:
+                      live[row["id"]] = row["version"]
+          except urllib.error.URLError as e:
+              print(f"warning: could not fetch live registry, treating everything as new: {e}")
+
+          changed = {
+              ext_id: entry
+              for ext_id, entry in toml_data.items()
+              if live.get(ext_id) != entry.get("version")
+          }
+          print(f"{len(changed)} of {len(toml_data)} extensions changed")
+
+          assets_dir = pathlib.Path("/tmp/release-assets")
+          assets_dir.mkdir(parents=True, exist_ok=True)
+          results = []
+
+          for ext_id, entry in changed.items():
+              submodule = pathlib.Path(entry["submodule"])
+              sub_path = entry.get("path")
+              source_dir = submodule / sub_path if sub_path else submodule
+
+              if not source_dir.is_dir():
+                  print(f"skipping {ext_id}: {source_dir} not checked out (empty submodule?)")
+                  continue
+
+              out_dir = pathlib.Path("/tmp/out") / ext_id
+              scratch_dir = pathlib.Path("/tmp/scratch") / ext_id
+
+              try:
+                  subprocess.run(
+                      [
+                          "zed_Source/target/release/extension_cli",
+                          "--source-dir", str(source_dir),
+                          "--output-dir", str(out_dir),
+                          "--scratch-dir", str(scratch_dir),
+                      ],
+                      check=True,
+                  )
+              except subprocess.CalledProcessError as e:
+                  print(f"failed to build {ext_id}, skipping: {e}")
+                  continue
+
+              manifest = json.loads((out_dir / "manifest.json").read_text())
+              asset_name = f"{ext_id}-{manifest['version']}.tar.gz"
+              (out_dir / "archive.tar.gz").rename(assets_dir / asset_name)
+
+              results.append({"id": ext_id, "asset_name": asset_name, **manifest})
+
+          pathlib.Path("/tmp/results.json").write_text(json.dumps(results))
+          print(f"{len(results)} extension(s) built successfully")
+          PY
+
+      - name: Create release with the built archives
+        id: release
+        if: hashFiles('/tmp/release-assets/*') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="registry-sync-${{ github.run_number }}"
+          gh release create "$tag" /tmp/release-assets/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "Registry sync #${{ github.run_number }}" \
+            --notes "Automated sync from zed-industries/extensions."
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Notify the registry sync endpoint
+        if: steps.release.outputs.tag != ''
+        env:
+          SYNC_SECRET: ${{ secrets.FORGE_REGISTRY_SYNC_SECRET }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import urllib.request
+
+          results = json.loads(pathlib.Path("/tmp/results.json").read_text())
+          tag = os.environ["RELEASE_TAG"]
+          repo = os.environ["REPO"]
+
+          payload = {
+              "extensions": [
+                  {
+                      "id": r["id"],
+                      "version": r["version"],
+                      "name": r["name"],
+                      "description": r.get("description"),
+                      "authors": r["authors"],
+                      "repository": r["repository"],
+                      "schema_version": r.get("schema_version"),
+                      "wasm_api_version": r.get("wasm_api_version"),
+                      "provides": r["provides"],
+                      "artifact_url": f"https://github.com/{repo}/releases/download/{tag}/{r['asset_name']}",
+                  }
+                  for r in results
+              ]
+          }
+
+          req = urllib.request.Request(
+              f"{os.environ['REGISTRY_API_URL']}/sync",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {os.environ['SYNC_SECRET']}",
+              },
+              method="POST",
+          )
+          with urllib.request.urlopen(req) as resp:
+              print(resp.read().decode())
+          PY
