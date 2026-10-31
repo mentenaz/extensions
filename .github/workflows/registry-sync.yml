@@ -58,7 +58,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
-      changed_json: ${{ steps.diff.outputs.changed_json }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -90,17 +89,25 @@ jobs:
       # Compares extensions.toml (post-merge) against the live registry's
       # versions. Anything new, removed-then-readded, or version-bumped —
       # whether that came from the upstream merge above or a direct commit
-      # to this fork — ends up in changed_json for build-and-publish to
-      # act on. No Rust needed here, so an empty diff stays fast.
+      # to this fork — gets uploaded as an artifact for build-and-publish
+      # to act on. No Rust needed here, so an empty diff stays fast.
       - name: Diff extensions.toml against the live registry
         id: diff
         run: |
           python3 - <<'PY'
           import json
           import os
+          import pathlib
           import tomllib
           import urllib.error
           import urllib.request
+
+          # Capped per run so a long gap since the last sync (or, as today,
+          # a still-empty registry) can't try to build hundreds of
+          # extensions in one job — it just catches up over several runs
+          # instead. Also keeps the list small enough to pass between jobs
+          # as a file without hitting argument/env size limits.
+          MAX_PER_RUN = 25
 
           with open("extensions.toml", "rb") as f:
               toml_data = tomllib.load(f)
@@ -113,20 +120,34 @@ jobs:
           except urllib.error.URLError as e:
               print(f"warning: could not fetch live registry, treating everything as new: {e}")
 
-          changed = [
-              {"id": ext_id, **entry}
-              for ext_id, entry in toml_data.items()
-              if live.get(ext_id) != entry.get("version")
-          ]
-          print(f"{len(changed)} of {len(toml_data)} extensions changed")
+          all_changed = sorted(
+              (
+                  {"id": ext_id, **entry}
+                  for ext_id, entry in toml_data.items()
+                  if live.get(ext_id) != entry.get("version")
+              ),
+              key=lambda e: e["id"],
+          )
+          changed = all_changed[:MAX_PER_RUN]
+          print(
+              f"{len(all_changed)} of {len(toml_data)} extensions changed; "
+              f"building {len(changed)} this run"
+          )
+
+          pathlib.Path("/tmp/changed.json").write_text(json.dumps(changed))
 
           github_output = os.environ["GITHUB_OUTPUT"]
           with open(github_output, "a") as f:
               f.write(f"changed={'true' if changed else 'false'}\n")
-              f.write("changed_json<<EOF\n")
-              f.write(json.dumps(changed))
-              f.write("\nEOF\n")
           PY
+
+      - name: Upload the changed-extensions list
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: changed-extensions
+          path: /tmp/changed.json
+          retention-days: 1
 
   build-and-publish:
     needs: sync-fork
@@ -140,10 +161,11 @@ jobs:
           submodules: false
           fetch-depth: 1
 
-      - name: Write the changed-extensions list
-        env:
-          CHANGED_JSON: ${{ needs.sync-fork.outputs.changed_json }}
-        run: echo "$CHANGED_JSON" > /tmp/changed.json
+      - name: Download the changed-extensions list
+        uses: actions/download-artifact@v4
+        with:
+          name: changed-extensions
+          path: /tmp
 
       # Only the submodules for extensions that actually changed — this
       # repo has 1000+ submodules, so `submodules: recursive` on checkout
