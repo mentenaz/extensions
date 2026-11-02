@@ -28,7 +28,7 @@
 #   FORGE_REGISTRY_SYNC_SECRET   shared secret; must match the same-named
 #                                 env var on the Forge_LandingPage Vercel
 #                                 project.
-#   ZED_SOURCE_TOKEN              only needed if mentenaz/zed_Source is
+#   ZED_SOURCE_TOKEN              only needed if mentenaz/mentenaz.Forge.Super is
 #                                 private — a PAT with read access to it,
 #                                 used to check it out to build extension_cli.
 #                                 Omit if that repo is public; the checkout
@@ -185,7 +185,7 @@ jobs:
       - name: Checkout Forge Super (for extension_cli)
         uses: actions/checkout@v4
         with:
-          repository: mentenaz/zed_Source
+          repository: mentenaz/mentenaz.Forge.Super
           path: zed_Source
           token: ${{ secrets.ZED_SOURCE_TOKEN || secrets.GITHUB_TOKEN }}
 
