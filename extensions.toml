@@ -4748,6 +4748,10 @@ version = "0.1.1"
 submodule = "extensions/ratveteinn-theme"
 version = "1.0.0"
 
+[razor]
+submodule = "extensions/razor"
+version = "0.1.1"
+
 [rcl]
 submodule = "extensions/rcl"
 version = "0.12.0"
