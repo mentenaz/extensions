@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
-      more_pending: ${{ steps.diff.outputs.more_pending }}
+      pending_total: ${{ steps.diff.outputs.pending_total }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -104,12 +104,16 @@ jobs:
           import urllib.error
           import urllib.request
 
-          # Capped per run so a long gap since the last sync (or, as today,
-          # a still-empty registry) can't try to build hundreds of
-          # extensions in one job — it just catches up over several runs
-          # instead. Also keeps the list small enough to pass between jobs
-          # as a file without hitting argument/env size limits.
-          MAX_PER_RUN = 20
+          # How many candidates the build job gets to try, not how many it
+          # builds (it stops at its own MAX_BUILD successes). More than that
+          # on purpose: an extension that cannot be built, such as one whose
+          # pinned grammar commit no longer exists upstream, is skipped, and
+          # if only the first MAX_BUILD were ever offered, the same broken
+          # ones at the front of the alphabet would be picked every run and
+          # hold up everything behind them. Capped so a long gap since the
+          # last sync still catches up over several runs, and so the list
+          # stays small enough to pass between jobs.
+          MAX_ATTEMPTS = 60
 
           with open("extensions.toml", "rb") as f:
               toml_data = tomllib.load(f)
@@ -130,10 +134,10 @@ jobs:
               ),
               key=lambda e: e["id"],
           )
-          changed = all_changed[:MAX_PER_RUN]
+          changed = all_changed[:MAX_ATTEMPTS]
           print(
               f"{len(all_changed)} of {len(toml_data)} extensions changed; "
-              f"building {len(changed)} this run"
+              f"offering {len(changed)} to the build job this run"
           )
 
           pathlib.Path("/tmp/changed.json").write_text(json.dumps(changed))
@@ -141,7 +145,7 @@ jobs:
           github_output = os.environ["GITHUB_OUTPUT"]
           with open(github_output, "a") as f:
               f.write(f"changed={'true' if changed else 'false'}\n")
-              f.write(f"more_pending={'true' if len(all_changed) > len(changed) else 'false'}\n")
+              f.write(f"pending_total={len(all_changed)}\n")
           PY
 
       - name: Upload the changed-extensions list
@@ -186,18 +190,6 @@ jobs:
           name: changed-extensions
           path: /tmp
 
-      # Only the submodules for extensions that actually changed — this
-      # repo has 1000+ submodules, so `submodules: recursive` on checkout
-      # would clone all of them every run.
-      - name: Fetch only the changed submodules
-        run: |
-          python3 -c "
-          import json
-          changed = json.load(open('/tmp/changed.json'))
-          print(' '.join(c['submodule'] for c in changed))
-          " > /tmp/submodule_paths.txt
-          xargs -a /tmp/submodule_paths.txt git submodule update --init --depth 1 --
-
       - name: Checkout Forge Super (for extension_cli)
         uses: actions/checkout@v4
         with:
@@ -224,18 +216,29 @@ jobs:
 
       - name: Build each changed extension
         id: build
+        env:
+          # extension_cli reports --lenient validation failures with
+          # log::warn!, which env_logger hides unless asked.
+          RUST_LOG: warn
         run: |
           python3 - <<'PY'
           import json
+          import os
           import pathlib
           import shutil
           import subprocess
+
+          # Try candidates in order until this many have built. A candidate
+          # that fails is skipped rather than ending the run, so a few
+          # genuinely broken extensions can't stop the rest.
+          MAX_BUILD = 20
 
           changed = json.load(open("/tmp/changed.json"))
 
           assets_dir = pathlib.Path("/tmp/release-assets")
           assets_dir.mkdir(parents=True, exist_ok=True)
           results = []
+          failures = []
 
           # One scratch directory for every extension, not one each: it is
           # where extension_cli downloads wasi-sdk (hundreds of MB), which
@@ -243,31 +246,63 @@ jobs:
           # downloaded it again for every extension that has a grammar.
           scratch_dir = pathlib.Path("/tmp/scratch")
 
+          def fail(ext_id, reason):
+              print(f"FAILED {ext_id}: {reason}")
+              failures.append({"id": ext_id, "reason": reason})
+
           for entry in changed:
+              if len(results) >= MAX_BUILD:
+                  break
+
               ext_id = entry["id"]
               submodule = pathlib.Path(entry["submodule"])
               sub_path = entry.get("path")
               source_dir = submodule / sub_path if sub_path else submodule
-
-              if not source_dir.is_dir():
-                  print(f"skipping {ext_id}: {source_dir} not checked out (empty submodule?)")
-                  continue
-
               out_dir = pathlib.Path("/tmp/out") / ext_id
 
               try:
-                  try:
+                  # This repo has 1000+ submodules, so each one is fetched
+                  # when it is needed rather than all of them up front.
+                  fetched = subprocess.run(
+                      ["git", "submodule", "update", "--init", "--depth", "1", "--", str(submodule)],
+                      capture_output=True, text=True,
+                  )
+                  if fetched.returncode != 0 or not source_dir.is_dir():
+                      last = (fetched.stderr.strip().splitlines() or ["not checked out"])[-1]
+                      fail(ext_id, f"could not fetch the submodule: {last}")
+                      continue
+
+                  # A Rust extension may pin its own toolchain
+                  # (rust-toolchain.toml), and extension_cli only adds the
+                  # wasm target to the default one, so the pinned toolchain
+                  # is missing it and the build dies with "can't find crate
+                  # for `core`". rustup honours the directory's override.
+                  if (source_dir / "Cargo.toml").exists():
                       subprocess.run(
-                          [
-                              "zed_Source/target/release/zed-extension",
-                              "--source-dir", str(source_dir),
-                              "--output-dir", str(out_dir),
-                              "--scratch-dir", str(scratch_dir),
-                          ],
-                          check=True,
+                          ["rustup", "target", "add", "wasm32-wasip2"],
+                          cwd=source_dir, capture_output=True, text=True,
                       )
-                  except subprocess.CalledProcessError as e:
-                      print(f"failed to build {ext_id}, skipping: {e}")
+
+                  built = subprocess.run(
+                      [
+                          os.path.abspath("zed_Source/target/release/zed-extension"),
+                          "--lenient",
+                          "--source-dir", str(source_dir),
+                          "--output-dir", str(out_dir),
+                          "--scratch-dir", str(scratch_dir),
+                      ],
+                      capture_output=True, text=True,
+                  )
+                  output = (built.stdout + built.stderr).strip()
+                  warnings = [l for l in output.splitlines() if "ignoring validation failure" in l]
+                  for w in warnings:
+                      print(f"{ext_id}: {w[:300]}")
+
+                  if built.returncode != 0:
+                      errors = [l.strip() for l in output.splitlines() if l.strip().startswith("Error:")]
+                      reason = errors[-1] if errors else (output.splitlines() or ["no output"])[-1].strip()
+                      print(output[-1500:])
+                      fail(ext_id, reason[:300])
                       continue
 
                   manifest = json.loads((out_dir / "manifest.json").read_text())
@@ -275,6 +310,7 @@ jobs:
                   (out_dir / "archive.tar.gz").rename(assets_dir / asset_name)
 
                   results.append({"id": ext_id, "asset_name": asset_name, **manifest})
+                  print(f"built {ext_id} {manifest['version']}")
               finally:
                   # A Rust extension compiles into its own target/ inside
                   # the submodule checkout, which can be a GB or more and
@@ -285,11 +321,19 @@ jobs:
                   print(f"{ext_id}: {free_gb:.1f} GB free")
 
           pathlib.Path("/tmp/results.json").write_text(json.dumps(results))
-          print(f"{len(results)} extension(s) built successfully")
+          print(f"{len(results)} built, {len(failures)} failed")
 
-          import os
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"### Registry sync: {len(results)} built, {len(failures)} failed\n\n")
+              if failures:
+                  f.write("| Extension | Why it failed |\n|---|---|\n")
+                  for x in failures:
+                      reason = x["reason"].replace("|", "\\|")
+                      f.write(f"| `{x['id']}` | {reason} |\n")
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"built={'true' if results else 'false'}\n")
+              f.write(f"built_count={len(results)}\n")
           PY
 
       - name: Create release with the built archives
@@ -366,7 +410,9 @@ jobs:
       # Naturally stops once nothing's left; the schedule trigger then
       # covers ongoing incremental syncs as usual.
       - name: Trigger the next run if more of the backlog remains
-        if: needs.sync-fork.outputs.more_pending == 'true'
+        # Only while runs make progress: a run that built nothing would
+        # otherwise retrigger itself on the same head of the queue forever.
+        if: steps.build.outputs.built == 'true' && fromJSON(needs.sync-fork.outputs.pending_total) > fromJSON(steps.build.outputs.built_count)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run registry-sync.yml --repo "${{ github.repository }}"
