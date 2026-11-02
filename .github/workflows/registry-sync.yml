@@ -157,6 +157,22 @@ jobs:
     if: needs.sync-fork.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
+      # Run 41382309370 died with "No space left on device" 6 minutes into
+      # the build step: the zed_Source target/ directory, a wasi-sdk copy
+      # per extension and each Rust extension's own target/ add up to more
+      # than a stock runner's ~14GB of free space. Same step the Linux
+      # installer job already uses.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          docker-images: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
       - name: Checkout this fork (post-merge, submodules fetched below)
         uses: actions/checkout@v4
         with:
@@ -197,8 +213,13 @@ jobs:
         with:
           workspaces: "zed_Source -> target"
 
+      # No debuginfo: extension_cli never needs it, and the workspace's
+      # release profile keeps it, which makes target/ (and the cache saved
+      # from it) several times larger.
       - name: Build extension_cli
         working-directory: zed_Source
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
         run: cargo build --release -p extension_cli
 
       - name: Build each changed extension
@@ -207,6 +228,7 @@ jobs:
           python3 - <<'PY'
           import json
           import pathlib
+          import shutil
           import subprocess
 
           changed = json.load(open("/tmp/changed.json"))
@@ -214,6 +236,12 @@ jobs:
           assets_dir = pathlib.Path("/tmp/release-assets")
           assets_dir.mkdir(parents=True, exist_ok=True)
           results = []
+
+          # One scratch directory for every extension, not one each: it is
+          # where extension_cli downloads wasi-sdk (hundreds of MB), which
+          # it reuses when it is already there. A directory per extension
+          # downloaded it again for every extension that has a grammar.
+          scratch_dir = pathlib.Path("/tmp/scratch")
 
           for entry in changed:
               ext_id = entry["id"]
@@ -226,27 +254,35 @@ jobs:
                   continue
 
               out_dir = pathlib.Path("/tmp/out") / ext_id
-              scratch_dir = pathlib.Path("/tmp/scratch") / ext_id
 
               try:
-                  subprocess.run(
-                      [
-                          "zed_Source/target/release/zed-extension",
-                          "--source-dir", str(source_dir),
-                          "--output-dir", str(out_dir),
-                          "--scratch-dir", str(scratch_dir),
-                      ],
-                      check=True,
-                  )
-              except subprocess.CalledProcessError as e:
-                  print(f"failed to build {ext_id}, skipping: {e}")
-                  continue
+                  try:
+                      subprocess.run(
+                          [
+                              "zed_Source/target/release/zed-extension",
+                              "--source-dir", str(source_dir),
+                              "--output-dir", str(out_dir),
+                              "--scratch-dir", str(scratch_dir),
+                          ],
+                          check=True,
+                      )
+                  except subprocess.CalledProcessError as e:
+                      print(f"failed to build {ext_id}, skipping: {e}")
+                      continue
 
-              manifest = json.loads((out_dir / "manifest.json").read_text())
-              asset_name = f"{ext_id}-{manifest['version']}.tar.gz"
-              (out_dir / "archive.tar.gz").rename(assets_dir / asset_name)
+                  manifest = json.loads((out_dir / "manifest.json").read_text())
+                  asset_name = f"{ext_id}-{manifest['version']}.tar.gz"
+                  (out_dir / "archive.tar.gz").rename(assets_dir / asset_name)
 
-              results.append({"id": ext_id, "asset_name": asset_name, **manifest})
+                  results.append({"id": ext_id, "asset_name": asset_name, **manifest})
+              finally:
+                  # A Rust extension compiles into its own target/ inside
+                  # the submodule checkout, which can be a GB or more and
+                  # is of no use once the archive exists.
+                  shutil.rmtree(source_dir / "target", ignore_errors=True)
+                  shutil.rmtree(out_dir, ignore_errors=True)
+                  free_gb = shutil.disk_usage("/").free / 2**30
+                  print(f"{ext_id}: {free_gb:.1f} GB free")
 
           pathlib.Path("/tmp/results.json").write_text(json.dumps(results))
           print(f"{len(results)} extension(s) built successfully")
