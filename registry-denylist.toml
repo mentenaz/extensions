@@ -1,0 +1,43 @@
+# Extensions the registry sync leaves out on purpose.
+#
+# A line here keeps an extension out of the build queue, so it is not tried on
+# every run and does not hold up the "nothing left to build" check. The
+# extension stays in extensions.toml and in its submodule, so merging
+# zed-industries/extensions never conflicts with this and never brings one back
+# into the registry.
+#
+# To let one back in, delete its section. The next sync tries it again.
+# An extension that is already published stays published; to take one down use
+# the remove-extension workflow.
+#
+# Add a section for an extension that cannot be built and is not worth fixing:
+#
+#   [extension-id]
+#   reason = "why, and when it was checked"
+
+[arturo]
+reason = "The grammar's pinned revision can no longer be fetched (checked 2026-11-03)."
+
+[coi]
+reason = "The source repository, jturner/zed-coi, no longer exists (checked 2026-11-03)."
+
+[duckyscript]
+reason = "The grammar's pinned revision can no longer be fetched; the grammar repository looks gone (checked 2026-11-03)."
+
+[fiberplane-studio]
+reason = "Its locked url 2.5.2 does not build for wasm32-wasip2; it needs a fix inside the extension (checked 2026-11-03)."
+
+[jai]
+reason = "The grammar's pinned revision can no longer be fetched; the grammar repository looks gone (checked 2026-11-03)."
+
+[po]
+reason = "Its host, git.disroot.org, did not answer on port 443 from here or from GitHub (checked 2026-11-03). May come back."
+
+[vanta-theme]
+reason = "The Codeberg repository was converted to SHA-256 Git, so the pinned commit is gone and cannot be pinned again (checked 2026-11-03)."
+
+[visqode-theme]
+reason = "The source repository, icrmahin/visqode-zed-theme, no longer exists (checked 2026-11-03)."
+
+[xmake]
+reason = "Its dependency which 8.0.6 does not build for wasm32-wasip2; it needs a fix inside the extension (checked 2026-11-03)."

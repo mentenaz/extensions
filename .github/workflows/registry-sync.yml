@@ -118,6 +118,15 @@ jobs:
           with open("extensions.toml", "rb") as f:
               toml_data = tomllib.load(f)
 
+          # Extensions left out on purpose (see registry-denylist.toml). Dropped
+          # here, not from extensions.toml, so merging upstream never conflicts
+          # and never brings one back.
+          with open("registry-denylist.toml", "rb") as f:
+              denied = tomllib.load(f)
+          skipped = sorted(ext_id for ext_id in toml_data if ext_id in denied)
+          if skipped:
+              print(f"{len(skipped)} extensions are on the denylist and are not built: {', '.join(skipped)}")
+
           live = {}
           try:
               with urllib.request.urlopen(f"{os.environ['REGISTRY_API_URL']}/extensions") as resp:
@@ -142,7 +151,7 @@ jobs:
               (
                   {"id": ext_id, **entry}
                   for ext_id, entry in toml_data.items()
-                  if live.get(ext_id) != entry.get("version")
+                  if ext_id not in denied and live.get(ext_id) != entry.get("version")
               ),
               key=lambda e: e["id"],
           )
