@@ -1,0 +1,173 @@
+# One-off: fills in the README of every extension that was published before the
+# sync started capturing them. The sync (registry-sync.yml) only builds an
+# extension whose version changed, so it will never come back for these.
+#
+# It does not clone anything. For each extension the registry has no README for,
+# it reads the pinned commit and the repository from this fork (the submodule
+# entry), downloads the README from raw.githubusercontent.com at that commit
+# (from the right sub-folder for an extension that lives inside a larger
+# repository), and sends them to the registry in batches.
+#
+#   GET  /api/registry/readmes?limit=&after=   ids of the latest versions with no README yet
+#   POST /api/registry/readmes                 { readmes: [{ id, readme, readme_raw_base, readme_blob_base }] }
+#
+# An empty README ("") means "looked, none found", so that extension is not
+# looked at again. A request that fails for another reason (a rate limit, a
+# timeout) leaves the extension without one; the run starts over while it makes
+# progress, so those are tried again.
+#
+# Uses the same secret as registry-sync.yml (FORGE_REGISTRY_SYNC_SECRET).
+
+name: backfill-readmes
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: backfill-readmes
+  cancel-in-progress: false
+
+env:
+  REGISTRY_API_URL: https://forge.mentenaz-server.com/api/registry
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout this fork (no submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch the missing READMEs and send them
+        id: backfill
+        env:
+          SYNC_SECRET: ${{ secrets.FORGE_REGISTRY_SYNC_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import re
+          import subprocess
+          import tomllib
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          API = os.environ["REGISTRY_API_URL"]
+          HEADERS = {
+              "Authorization": f"Bearer {os.environ['SYNC_SECRET']}",
+              "Content-Type": "application/json",
+          }
+          BATCH = 200
+          README_LIMIT = 100_000  # characters, as in registry-sync.yml
+          MAX_BYTES = 500_000  # never read more than this from one file
+          # Markdown first; the page renders Markdown, so a .rst or .txt would
+          # show as plain text and is only a fallback.
+          NAMES = ["README.md", "readme.md", "Readme.md", "README.markdown", "README", "README.txt"]
+
+          with open("extensions.toml", "rb") as f:
+              toml = tomllib.load(f)
+
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, text=True).stdout.strip()
+
+          def request(method, url, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(url, data=data, headers=HEADERS, method=method)
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  return json.load(resp)
+
+          class Transient(Exception):
+              """The README may exist but could not be read right now."""
+
+          def fetch(url):
+              """The text at url, None when it does not exist (404)."""
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as resp:
+                      return resp.read(MAX_BYTES).decode("utf-8", errors="replace")
+              except urllib.error.HTTPError as error:
+                  if error.code in (404, 410, 451):
+                      return None
+                  raise Transient(f"HTTP {error.code} for {url}")
+              except (urllib.error.URLError, TimeoutError, OSError) as error:
+                  raise Transient(f"{error} for {url}")
+
+          def look_up(ext_id):
+              """One extension's README fields, or None when it should be retried."""
+              entry = toml.get(ext_id)
+              if entry is None:
+                  # No longer in extensions.toml: nothing to read it from.
+                  return {"id": ext_id, "readme": "", "readme_raw_base": None, "readme_blob_base": None}
+              submodule = entry["submodule"]
+              url = git("config", "-f", ".gitmodules", "--get", f"submodule.{submodule}.url")
+              sha = git("ls-tree", "HEAD", submodule).split()[2:3]
+              match = re.match(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+              if not match or not sha:
+                  # Not on GitHub (or not pinned): there is nothing it can be
+                  # fetched from here and no base to resolve links against.
+                  return {"id": ext_id, "readme": "", "readme_raw_base": None, "readme_blob_base": None}
+              owner, repo = match.groups()
+              folder = f"{entry['path'].strip('/')}/" if entry.get("path") else ""
+              raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{sha[0]}/{folder}"
+              blob_base = f"https://github.com/{owner}/{repo}/blob/{sha[0]}/{folder}"
+              readme = ""
+              try:
+                  for name in NAMES:
+                      text = fetch(raw_base + urllib.parse.quote(name))
+                      if text is not None:
+                          readme = text.replace("\x00", "")[:README_LIMIT]
+                          break
+              except Transient as error:
+                  print(f"retry later: {ext_id}: {error}")
+                  return None
+              return {"id": ext_id, "readme": readme, "readme_raw_base": raw_base, "readme_blob_base": blob_base}
+
+          posted = 0
+          skipped = 0
+          after = ""
+          while True:
+              query = urllib.parse.urlencode({"limit": BATCH, "after": after})
+              listing = request("GET", f"{API}/readmes?{query}")
+              ids = listing["ids"]
+              if not ids:
+                  break
+              after = ids[-1]
+
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  found = list(pool.map(look_up, ids))
+              ready = [item for item in found if item is not None]
+              skipped += len(found) - len(ready)
+
+              if ready:
+                  answer = request("POST", f"{API}/readmes", {"readmes": ready})
+                  posted += answer.get("updated", 0)
+                  if answer.get("failed"):
+                      print("the registry could not store:", answer["failed"])
+              print(f"batch up to {after}: {len(ready)} sent, {len(found) - len(ready)} to retry; {posted} sent so far")
+
+          print(f"done: {posted} sent, {skipped} to retry")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"posted={posted}\n")
+              f.write(f"skipped={skipped}\n")
+          PY
+
+      # Starts over while something was sent and something was left to retry; a
+      # pass that sent nothing would only repeat itself.
+      - name: Run again for the ones that could not be read
+        if: steps.backfill.outputs.skipped != '0' && steps.backfill.outputs.posted != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run backfill-readmes.yml --repo "${{ github.repository }}"
