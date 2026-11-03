@@ -333,16 +333,34 @@ jobs:
                           cwd=source_dir, capture_output=True, text=True,
                       )
 
-                  built = subprocess.run(
-                      [
-                          os.path.abspath("zed_Source/target/release/zed-extension"),
-                          "--lenient",
-                          "--source-dir", str(source_dir),
-                          "--output-dir", str(out_dir),
-                          "--scratch-dir", str(scratch_dir),
-                      ],
-                      capture_output=True, text=True,
-                  )
+                  def build(env=None):
+                      return subprocess.run(
+                          [
+                              os.path.abspath("zed_Source/target/release/zed-extension"),
+                              "--lenient",
+                              "--source-dir", str(source_dir),
+                              "--output-dir", str(out_dir),
+                              "--scratch-dir", str(scratch_dir),
+                          ],
+                          capture_output=True, text=True, env=env,
+                      )
+
+                  built = build()
+
+                  # An extension that pins an old Rust toolchain (typos pins
+                  # 1.80) can fail on dependencies that need a newer cargo,
+                  # which says nothing about the extension itself. Try once
+                  # more with the current stable toolchain; RUSTUP_TOOLCHAIN
+                  # outranks the pin. An extension that still fails is
+                  # reported with the second error.
+                  pins_toolchain = any((source_dir / n).exists() for n in ("rust-toolchain.toml", "rust-toolchain"))
+                  if built.returncode != 0 and pins_toolchain:
+                      print(f"{ext_id}: failed with its pinned toolchain; retrying with current stable Rust")
+                      subprocess.run(
+                          ["rustup", "toolchain", "install", "stable", "--profile", "minimal", "--target", "wasm32-wasip2"],
+                          capture_output=True, text=True,
+                      )
+                      built = build({**os.environ, "RUSTUP_TOOLCHAIN": "stable"})
                   output = (built.stdout + built.stderr).strip()
                   warnings = [l for l in output.splitlines() if "ignoring validation failure" in l]
                   for w in warnings:
