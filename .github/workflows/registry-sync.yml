@@ -28,6 +28,14 @@
 #   FORGE_REGISTRY_SYNC_SECRET   shared secret; must match the same-named
 #                                 env var on the Forge_LandingPage Vercel
 #                                 project.
+#   SYNC_PUSH_TOKEN               a fine-grained PAT for this repository with
+#                                 Contents and Workflows read and write, so
+#                                 sync-fork can push a merge that changes
+#                                 upstream's workflow files. It expires: when
+#                                 it does, the merge step fails with "refusing
+#                                 to allow a GitHub App to create or update
+#                                 workflow ... without `workflows`
+#                                 permission", and renewing the token fixes it.
 #   ZED_SOURCE_TOKEN              only needed if mentenaz/mentenaz.Forge.Super is
 #                                 private — a PAT with read access to it,
 #                                 used to check it out to build extension_cli.
@@ -61,11 +69,19 @@ jobs:
       changed: ${{ steps.diff.outputs.changed }}
       pending_total: ${{ steps.diff.outputs.pending_total }}
     steps:
+      # The push below needs more than GITHUB_TOKEN can ever do: when upstream's
+      # merge changes a file under .github/workflows (its dependency updates do,
+      # every week or two), GitHub refuses the push unless the token has the
+      # `workflows` permission, and GITHUB_TOKEN can never have it. So this job
+      # checks out, and later pushes, with SYNC_PUSH_TOKEN. Without that secret
+      # it falls back to GITHUB_TOKEN, which works until upstream next touches
+      # a workflow file.
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: false
+          token: ${{ secrets.SYNC_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
         run: |
